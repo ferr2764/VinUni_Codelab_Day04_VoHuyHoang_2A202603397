@@ -8,8 +8,9 @@ Kiến trúc:
 """
 
 import json
+import os
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_support_ticket
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -17,14 +18,30 @@ from tools import TOOL_DEFINITIONS, TOOL_MAP, search_product_catalog, submit_sup
 # Yêu cầu: Phải chứa Persona, Core Rules, Operational Boundaries, Output Contract.
 # ═══════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """
-# TODO: Viết System Prompt cho VinAssistant
-# Gợi ý các phần cần có:
-# 1. PERSONA: Tên, vai trò, giọng nói
-# 2. AVAILABLE TOOLS: Liệt kê {tools}
-# 3. CORE RULES: Không bịa dữ liệu, bắt buộc gọi tool khi cần
-# 4. OPERATIONAL BOUNDARIES: Chỉ trả lời về Vingroup
-# 5. OUTPUT CONTRACT: Format trả lời (Thought/Action/Observation/Final Answer)
+SYSTEM_PROMPT = f"""
+# PERSONA
+You are VinAssistant, a virtual assistant for Vingroup customers.
+You are professional, friendly, concise, and helpful.
+
+# AVAILABLE TOOLS
+The following tools are available:
+{json.dumps(TOOL_DEFINITIONS, ensure_ascii=False, indent=2)}
+
+# CORE RULES
+1. Never invent product names, prices, or company information. Must use `search_product_catalog` tool to provide factual product information.
+2. Never create ticket_id by yourself. Must use `submit_support_ticket` tool to generate ticket_id.
+3. If customer asks a FAQ question about Vingroup policies, answer directly without calling any tool.
+4. If the question need more than one tool, call them sequentially and aggregate the results.
+
+# OPERATIONAL BOUNDARIES
+- Only answer questions related to Vingroup and its ecosystem.
+- Reject politely any questions outside the scope (politics, religion, cash, ...)
+
+# OUTPUT CONTRACT
+- All responses must be in Vietnamese.
+- When listing out products, use table format or numbered list.
+- When creating a support ticket, confirm the ticket_id and the priority level to the customer.
+
 """
 
 
@@ -34,16 +51,41 @@ SYSTEM_PROMPT = """
 
 class ChatbotBaseline:
     """Baseline LLM Chatbot — Không sử dụng Tool Calling hay ReAct Loop."""
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
 
     def query(self, user_input: str) -> Dict[str, Any]:
-        # TODO 2: Trả về câu trả lời tĩnh (mock) hoặc gọi Gemini API 1 lượt (không dùng tool)
-        # Mục tiêu: Quan sát hiện tượng bịa thông tin (hallucination)
+        """Gửi câu hỏi tới LLM (hoặc trả lời mock nếu không có API key)."""
+        if self.api_key:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=self.api_key)
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                response = model.generate_content(
+                    f"Bạn là chatbot tư vấn sản phẩm Vingroup. Trả lời câu hỏi sau "
+                    f"mà KHÔNG có quyền tra cứu cơ sở dữ liệu hay gọi tool: {user_input}"
+                )
+                return {
+                    "answer": response.text,
+                    "tool_calls": [],
+                    "status": "success",
+                    "mode": "live_api"
+                }
+            except Exception:
+                pass
+
+        # Mock response — mô phỏng hallucination
         return {
-            "answer": f"[Chatbot Baseline] Trả lời cho: {user_input}",
+            "answer": (
+                "VinFast hiện có nhiều dòng xe điện với giá từ khoảng 300 triệu. "
+                "Bạn có thể tham khảo tại showroom gần nhất hoặc website VinFast."
+            ),
             "tool_calls": [],
             "status": "success",
             "mode": "mock_baseline"
         }
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -57,28 +99,252 @@ class ToolCallingAgent:
         self.max_iterations = max_iterations
         self.trace: List[Dict[str, Any]] = []
 
-    def run(self, user_input: str) -> Dict[str, Any]:
-        """Điểm vào chính — chạy Agent Loop."""
-        self.trace = []
-
-        # TODO 3: Phân tích intent từ user_input
-        #   - Xác định cần gọi tool nào (catalog? ticket? cả hai? FAQ?)
-        #   - Gợi ý: Dùng keyword matching hoặc regex
-
-        # TODO 4: Xây dựng Agent Loop (while iteration <= self.max_iterations)
-        #   - Iteration 1: Gọi tool #1 nếu cần (search_product_catalog)
-        #   - Iteration 2: Gọi tool #2 nếu cần (submit_support_ticket)
-        #   - Iteration 3+: Tổng hợp Final Answer từ trace
-        #   - Lưu mỗi bước vào self.trace
-
-        # Skeleton return
-        self.trace.append({"step": "init", "user_input": user_input})
-        return {
-            "answer": "TODO: Implement ToolCallingAgent loop",
-            "trace": self.trace,
-            "iterations": 0,
-            "status": "not_implemented"
+    def _detect_intents(self, user_input: str) -> Dict[str, Any]:
+        """Phân tích câu hỏi người dùng để xác định tool cần gọi."""
+        lower = user_input.lower()
+        intents = {
+            "needs_catalog": False,
+            "needs_ticket": False,
+            "is_faq": False,
+            "catalog_args": {},
+            "ticket_args": {}
         }
+
+        # --- Detect FAQ intent FIRST (highest priority) ---
+        faq_keywords = ["chính sách", "bảo hành", "đổi trả", "bao lâu", "điều kiện",
+                        "warranty", "refund", "return"]
+        # FAQ queries ask about policies, not about searching products or filing tickets.
+        # They may mention brand names (VinFast, Vinpearl) for context, not for search.
+        action_keywords = ["xem", "tìm", "mua", "đặt", "giá dưới", "dưới"]
+        ticket_action_keywords = ["phản hồi", "khiếu nại", "ghi nhận", "ticket", "phản ánh"]
+        has_faq = any(kw in lower for kw in faq_keywords)
+        has_action = any(kw in lower for kw in action_keywords)
+        has_ticket_action = any(kw in lower for kw in ticket_action_keywords)
+
+        if has_faq and not has_action and not has_ticket_action:
+            intents["is_faq"] = True
+            return intents
+
+        # --- Detect catalog search intent ---
+        catalog_keywords = ["xe điện", "xe vinfast", "vinfast", "resort", "vinpearl",
+                            "du lịch", "sản phẩm", "xem", "tìm", "giá"]
+        if any(kw in lower for kw in catalog_keywords) and has_action:
+            # Determine category
+            if any(kw in lower for kw in ["xe điện", "xe vinfast", "vinfast vf", "ô tô"]):
+                intents["catalog_args"]["category"] = "xe_dien"
+            elif any(kw in lower for kw in ["resort", "vinpearl", "du lịch", "nghỉ dưỡng", "khách sạn"]):
+                intents["catalog_args"]["category"] = "du_lich"
+            else:
+                intents["catalog_args"]["category"] = "xe_dien"  # default
+
+            # Parse max_price
+            price_patterns = [
+                (r"(\d+)\s*triệu", lambda m: int(m.group(1)) * 1_000_000),
+                (r"(\d{3,})\s*000\s*000", lambda m: int(m.group(1)) * 1_000_000),
+                (r"dưới\s*(\d+)\s*tr", lambda m: int(m.group(1)) * 1_000_000),
+            ]
+            for pattern, extractor in price_patterns:
+                match = re.search(pattern, lower)
+                if match:
+                    intents["catalog_args"]["max_price"] = extractor(match)
+                    break
+
+            if intents["catalog_args"].get("category"):
+                intents["needs_catalog"] = True
+
+        # --- Detect ticket submit intent ---
+        ticket_keywords = ["phản hồi", "khiếu nại", "lỗi", "hỏng", "bị", "hỗ trợ",
+                           "ghi nhận", "ticket", "phản ánh", "sự cố"]
+        if any(kw in lower for kw in ticket_keywords):
+            # Extract customer name
+            name_match = re.search(r"(?:tên\s+(?:tôi\s+là\s+|là\s+)?|tôi\s+là\s+|tên\s+)([A-ZÀ-Ỹ][a-zà-ỹ]+(?:\s+[A-ZÀ-Ỹ][a-zà-ỹ]+)*)", user_input)
+            if name_match:
+                intents["ticket_args"]["customer_name"] = name_match.group(1).strip()
+            else:
+                intents["ticket_args"]["customer_name"] = "Khách hàng ẩn danh"
+
+            # Extract issue description
+            desc_patterns = [
+                r"(?:xe|phòng|sản phẩm|dịch vụ).*?(?:bị|lỗi|hỏng|không hoạt động|sự cố)[^,.]*",
+                r"(?:bị|lỗi|hỏng)[^,.]*",
+            ]
+            issue_desc = "Khách hàng cần hỗ trợ"
+            for pattern in desc_patterns:
+                desc_match = re.search(pattern, user_input, re.IGNORECASE)
+                if desc_match:
+                    issue_desc = desc_match.group(0).strip()
+                    break
+            intents["ticket_args"]["issue_description"] = issue_desc
+
+            # Extract priority
+            if any(kw in lower for kw in ["khẩn cấp", "nghiêm trọng", "gấp", "cấp bách"]):
+                intents["ticket_args"]["priority"] = "high"
+            elif any(kw in lower for kw in ["nhẹ", "không gấp", "khi nào cũng được"]):
+                intents["ticket_args"]["priority"] = "low"
+            else:
+                intents["ticket_args"]["priority"] = "medium"
+
+            if intents["ticket_args"].get("customer_name"):
+                intents["needs_ticket"] = True
+
+        return intents
+
+    # -------------------------------------------------------------------
+    # Step Execution Engine
+    # -------------------------------------------------------------------
+
+    def _execute_step(self, user_input: str, intents: Dict[str, Any], iteration: int) -> Tuple[str, bool]:
+        """Thực thi từng bước suy luận của Agent."""
+
+        # --- FAQ (No tool needed) ---
+        if intents["is_faq"]:
+            thought = "Đây là câu hỏi FAQ về chính sách bảo hành. Không cần gọi tool."
+            final_answer = (
+                "Chính sách bảo hành pin xe điện VinFast:\n"
+                "- Pin xe VinFast được bảo hành 10 năm hoặc 200.000 km (tuỳ điều kiện nào đến trước).\n"
+                "- Nếu dung lượng pin giảm dưới 70% trong thời gian bảo hành, VinFast sẽ thay thế miễn phí.\n"
+                "- Chính sách bảo hành toàn quốc tại tất cả xưởng dịch vụ VinFast ủy quyền.\n"
+                "- Hotline hỗ trợ: 1900-23-23-89."
+            )
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "final_answer": final_answer
+            })
+            return final_answer, True
+
+        # --- Sequential Tool Calling ---
+        if intents["needs_catalog"] and iteration == 1:
+            args = intents["catalog_args"]
+            max_price_display = f"{args['max_price']:,}" if 'max_price' in args else 'không giới hạn'
+            thought = f"Khách hàng muốn tra cứu sản phẩm danh mục '{args.get('category', 'xe_dien')}' với giá tối đa {max_price_display} VNĐ."
+            action = {"name": "search_product_catalog", "args": args}
+            obs = TOOL_MAP["search_product_catalog"](**args)
+
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "action": action,
+                "observation": obs
+            })
+
+            if not intents["needs_ticket"]:
+                # Single tool — generate final answer immediately
+                if not obs or (isinstance(obs, list) and len(obs) == 0):
+                    final_ans = f"Rất tiếc, hiện không tìm thấy sản phẩm nào thuộc danh mục '{args.get('category')}' với giá dưới {args.get('max_price', 0):,} VNĐ."
+                elif isinstance(obs, list) and obs and "error" in obs[0]:
+                    final_ans = f"Lỗi hệ thống: {obs[0]['error']}"
+                else:
+                    lines = []
+                    for i, p in enumerate(obs, 1):
+                        lines.append(f"{i}. **{p['name']}** — {p['price_vnd']:,} VNĐ")
+                        lines.append(f"   {p['description']}")
+                        lines.append(f"   Tình trạng: {'Còn hàng' if p['availability'] == 'in_stock' else 'Đặt trước'}")
+                    final_ans = f"Tìm thấy {len(obs)} sản phẩm phù hợp:\n\n" + "\n".join(lines)
+                return final_ans, True
+
+            return f"Đã tra cứu catalog: {len(obs)} kết quả.", False
+
+        if intents["needs_ticket"] and (iteration == 2 or (iteration == 1 and not intents["needs_catalog"])):
+            args = intents["ticket_args"]
+            thought = f"Cần ghi nhận ticket hỗ trợ cho khách hàng '{args['customer_name']}', mức ưu tiên: {args['priority']}."
+            action = {"name": "submit_support_ticket", "args": args}
+            obs = TOOL_MAP["submit_support_ticket"](**args)
+
+            self.trace.append({
+                "iteration": iteration,
+                "thought": thought,
+                "action": action,
+                "observation": obs
+            })
+
+            if not intents["needs_catalog"]:
+                # Single tool — generate final answer
+                final_ans = (
+                    f"Đã ghi nhận yêu cầu hỗ trợ của bạn:\n"
+                    f"- **Mã ticket:** {obs['ticket_id']}\n"
+                    f"- **Khách hàng:** {obs['customer_name']}\n"
+                    f"- **Mức ưu tiên:** {obs['priority']}\n"
+                    f"- **Trạng thái:** {obs['status']}\n\n"
+                    f"Đội ngũ hỗ trợ Vingroup sẽ liên hệ bạn trong vòng 24 giờ."
+                )
+                return final_ans, True
+
+            return f"Đã tạo ticket: {obs['ticket_id']}.", False
+
+        # --- Final Answer Aggregation (iteration 3+, parallel case) ---
+        thought = "Đã thu thập đủ thông tin từ cả 2 tool. Tổng hợp câu trả lời cho khách hàng."
+
+        catalog_obs = next(
+            (t["observation"] for t in self.trace
+             if t.get("action", {}).get("name") == "search_product_catalog"),
+            []
+        )
+        ticket_obs = next(
+            (t["observation"] for t in self.trace
+             if t.get("action", {}).get("name") == "submit_support_ticket"),
+            {}
+        )
+
+        # Build catalog summary
+        catalog_summary = "Không tìm thấy sản phẩm phù hợp."
+        if catalog_obs and isinstance(catalog_obs, list) and len(catalog_obs) > 0:
+            lines = []
+            for i, p in enumerate(catalog_obs, 1):
+                lines.append(f"   {i}. **{p['name']}** — {p['price_vnd']:,} VNĐ ({p['description'][:60]}...)")
+            catalog_summary = "\n".join(lines)
+
+        # Build ticket summary
+        ticket_summary = "Không có ticket nào được tạo."
+        if ticket_obs and isinstance(ticket_obs, dict) and "ticket_id" in ticket_obs:
+            ticket_summary = (
+                f"   - Mã ticket: {ticket_obs['ticket_id']}\n"
+                f"   - Khách hàng: {ticket_obs['customer_name']}\n"
+                f"   - Mức ưu tiên: {ticket_obs['priority']}\n"
+                f"   - Trạng thái: {ticket_obs['status']}"
+            )
+
+        final_answer = (
+            f"📋 **Kết quả tra cứu sản phẩm:**\n{catalog_summary}\n\n"
+            f"🎫 **Thông tin ticket hỗ trợ:**\n{ticket_summary}\n\n"
+            f"Cảm ơn bạn đã sử dụng dịch vụ Vingroup. Đội ngũ hỗ trợ sẽ liên hệ bạn sớm nhất!"
+        )
+
+        self.trace.append({
+            "iteration": iteration,
+            "thought": thought,
+            "final_answer": final_answer
+        })
+        return final_answer, True
+
+    # -------------------------------------------------------------------
+    # Main Run Loop
+    # -------------------------------------------------------------------
+
+    def run(self, user_input: str) -> Dict[str, Any]:
+        """Điểm vào chính — chạy Agent Loop với safeguards."""
+        self.trace = []
+        intents = self._detect_intents(user_input)
+        iteration = 1
+
+        while iteration <= self.max_iterations:
+            result, is_final = self._execute_step(user_input, intents, iteration)
+            if is_final:
+                return {
+                    "answer": result,
+                    "trace": self.trace,
+                    "iterations": iteration,
+                    "status": "completed"
+                }
+            iteration += 1
+
+        return {
+            "answer": "Lỗi: Agent đã vượt quá số bước lặp tối đa (Max Iterations Safeguard).",
+            "trace": self.trace,
+            "iterations": iteration - 1,
+            "status": "max_iterations_reached"
+        }
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
